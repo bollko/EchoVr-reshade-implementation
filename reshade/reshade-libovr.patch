@@ -1,0 +1,665 @@
+diff --git a/ReShade.vcxproj b/ReShade.vcxproj
+index 8cc0465..1440a13 100644
+--- a/ReShade.vcxproj
++++ b/ReShade.vcxproj
+@@ -639,6 +639,7 @@
+     <ClCompile Include="source\opengl\opengl_impl_state_block.cpp" />
+     <ClCompile Include="source\opengl\opengl_impl_swapchain.cpp" />
+     <ClCompile Include="source\opengl\opengl_impl_type_convert.cpp" />
++    <ClCompile Include="source\libovr\libovr.cpp" />
+     <ClCompile Include="source\openvr\openvr.cpp" />
+     <ClCompile Include="source\openvr\openvr_impl_swapchain.cpp" />
+     <ClCompile Include="source\openxr\openxr.cpp" />
+diff --git a/ReShade.vcxproj.filters b/ReShade.vcxproj.filters
+index 445a02b..d041559 100644
+--- a/ReShade.vcxproj.filters
++++ b/ReShade.vcxproj.filters
+@@ -366,6 +366,9 @@
+     <ClCompile Include="source\opengl\opengl_impl_type_convert.cpp">
+       <Filter>api\opengl</Filter>
+     </ClCompile>
++    <ClCompile Include="source\libovr\libovr.cpp">
++      <Filter>hooks\openvr</Filter>
++    </ClCompile>
+     <ClCompile Include="source\openvr\openvr.cpp">
+       <Filter>hooks\openvr</Filter>
+     </ClCompile>
+diff --git a/res/exports.def b/res/exports.def
+index 4a530bf..87308d5 100644
+--- a/res/exports.def
++++ b/res/exports.def
+@@ -465,6 +465,14 @@ EXPORTS
+ 	VR_ShutdownInternal PRIVATE
+ 	VR_GetGenericInterface PRIVATE
+ 
++	; LibOVRRTImpl64_1.dll
++	ovr_CreateTextureSwapChainDX PRIVATE
++	ovr_DestroyTextureSwapChain PRIVATE
++	ovr_CommitTextureSwapChain PRIVATE
++	ovr_EndFrame PRIVATE
++	ovr_SubmitFrame2 PRIVATE
++	ovr_Destroy PRIVATE
++
+ 	; vulkan-1.dll
+ 	vkNegotiateLoaderLayerInterfaceVersion
+ 	vkCreateDevice PRIVATE
+diff --git a/source/d3d12/d3d12_command_list.cpp b/source/d3d12/d3d12_command_list.cpp
+index 2b3b57f..09fa77c 100644
+--- a/source/d3d12/d3d12_command_list.cpp
++++ b/source/d3d12/d3d12_command_list.cpp
+@@ -10,6 +10,7 @@
+ #include "dll_log.hpp"
+ #include "com_utils.hpp"
+ #include "addon_manager.hpp"
++#include <atomic>
+ 
+ using reshade::d3d12::to_handle;
+ 
+@@ -449,10 +450,16 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::SetPipelineState(ID3D12Pipeline
+ 	reshade::invoke_addon_event<reshade::addon_event::bind_pipeline>(this, reshade::api::pipeline_stage::all, to_handle(pPipelineState));
+ #endif
+ }
++extern std::atomic<uint32_t> g_libovr_num_tracked_resources;
++extern void libovr_track_resource_barriers(UINT num_barriers, const D3D12_RESOURCE_BARRIER *barriers);
++
+ void STDMETHODCALLTYPE D3D12GraphicsCommandList::ResourceBarrier(UINT NumBarriers, const D3D12_RESOURCE_BARRIER *pBarriers)
+ {
+ 	_orig->ResourceBarrier(NumBarriers, pBarriers);
+ 
++	if (g_libovr_num_tracked_resources.load(std::memory_order_relaxed) != 0)
++		libovr_track_resource_barriers(NumBarriers, pBarriers);
++
+ #if RESHADE_ADDON >= 2
+ 	if (!reshade::has_addon_event<reshade::addon_event::barrier>())
+ 		return;
+diff --git a/source/dll_main.cpp b/source/dll_main.cpp
+index b246178..be89e9f 100644
+--- a/source/dll_main.cpp
++++ b/source/dll_main.cpp
+@@ -359,6 +359,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
+ 					// Do not register Vulkan hooks, since Vulkan layering mechanism is used instead
+ 
+ 					reshade::hooks::register_module(L"openvr_api.dll");
++#ifdef _WIN64
++					reshade::hooks::register_module(L"LibOVRRTImpl64_1.dll");
++#endif
+ 				}
+ 			}
+ 
+diff --git a/source/libovr/libovr.cpp b/source/libovr/libovr.cpp
+new file mode 100644
+index 0000000..63ac290
+--- /dev/null
++++ b/source/libovr/libovr.cpp
+@@ -0,0 +1,516 @@
++/*
++ * LibOVR (Oculus PC SDK) support: applies effects to the eye textures an application submits directly to the Oculus runtime.
++ * Reuses the OpenVR side-by-side swap chain implementation, but copies the result back into the application's eye texture
++ * right before the eye texture swap chain is committed (so that the fence signaled by the commit covers the effect rendering).
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include "openvr/openvr_impl_swapchain.hpp"
++#include "d3d12/d3d12_device.hpp"
++#include "d3d12/d3d12_command_queue.hpp"
++#include "d3d12/d3d12_impl_type_convert.hpp"
++#include "dll_log.hpp"
++#include "ini_file.hpp"
++#include "com_utils.hpp"
++#include "hook_manager.hpp"
++#include "runtime.hpp"
++#include <filesystem>
++#include <cstring> // std::memcpy, std::memcmp
++#include <mutex>
++#include <atomic>
++#include <vector>
++#include <algorithm> // std::find, std::min
++#include <unordered_map>
++
++// Minimal subset of the LibOVR C API (see OVR_CAPI.h and OVR_CAPI_D3D.h)
++typedef int ovrResult;
++typedef struct ovrHmdStruct *ovrSession;
++typedef struct ovrTextureSwapChainData *ovrTextureSwapChain;
++
++struct ovrTextureSwapChainDesc
++{
++	int Type;
++	int Format;
++	int ArraySize;
++	int Width;
++	int Height;
++	int MipLevels;
++	int SampleCount;
++	char StaticImage;
++	unsigned int MiscFlags;
++	unsigned int BindFlags;
++};
++
++struct ovrRecti
++{
++	int x, y, w, h;
++};
++
++struct ovrLayerHeader
++{
++	int Type;
++	unsigned int Flags;
++	// Newer SDK versions append 'char Reserved[128]' here, which is detected at runtime (see 'update_eye_layer')
++};
++
++constexpr int ovrLayerType_EyeFov = 1;
++constexpr int ovrLayerType_EyeFovDepth = 2;
++constexpr int ovrLayerType_EyeMatrix = 5;
++constexpr int ovrLayerType_EyeFovMultires = 7;
++
++struct swapchain_info
++{
++	D3D12CommandQueue *queue = nullptr;
++	ovrTextureSwapChainDesc desc = {};
++};
++
++struct eye_layer
++{
++	bool valid = false;
++	ovrTextureSwapChain chain[2] = {};
++	ovrRecti viewport[2] = {};
++};
++
++static std::recursive_mutex s_mutex;
++static std::unordered_map<ovrTextureSwapChain, swapchain_info> s_swapchains;
++static eye_layer s_eye_layer;
++static std::vector<ovrTextureSwapChain> s_pending_commits;
++static reshade::openvr::swapchain_impl *s_vr_swapchain = nullptr;
++static bool s_disabled = false;
++static bool s_config_loaded = false;
++static reshade::api::resource_usage s_fallback_eye_state = reshade::api::resource_usage::shader_resource_pixel;
++
++// Resource state tracking for the eye textures (fed from 'D3D12GraphicsCommandList::ResourceBarrier'), since the LibOVR API does not specify which state the eye textures are in at commit time
++constexpr size_t MAX_TRACKED_RESOURCES = 16;
++std::atomic<uint32_t> g_libovr_num_tracked_resources = 0;
++static std::atomic<ID3D12Resource *> s_tracked_resources[MAX_TRACKED_RESOURCES] = {};
++static std::atomic<uint32_t> s_tracked_states[MAX_TRACKED_RESOURCES] = {};
++static constexpr uint32_t STATE_UNKNOWN = 0xFFFFFFFF;
++
++void libovr_track_resource_barriers(UINT num_barriers, const D3D12_RESOURCE_BARRIER *barriers)
++{
++	const uint32_t num_tracked = g_libovr_num_tracked_resources.load(std::memory_order_acquire);
++
++	for (UINT i = 0; i < num_barriers; ++i)
++	{
++		if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
++			continue;
++
++		for (uint32_t k = 0; k < num_tracked; ++k)
++		{
++			if (s_tracked_resources[k].load(std::memory_order_relaxed) == barriers[i].Transition.pResource)
++			{
++				s_tracked_states[k].store(static_cast<uint32_t>(barriers[i].Transition.StateAfter), std::memory_order_relaxed);
++				break;
++			}
++		}
++	}
++}
++
++static void track_resource(ID3D12Resource *resource)
++{
++	const uint32_t num_tracked = g_libovr_num_tracked_resources.load(std::memory_order_acquire);
++	for (uint32_t k = 0; k < num_tracked; ++k)
++		if (s_tracked_resources[k].load(std::memory_order_relaxed) == resource)
++			return;
++
++	if (num_tracked >= MAX_TRACKED_RESOURCES)
++		return;
++
++	s_tracked_resources[num_tracked].store(resource, std::memory_order_relaxed);
++	s_tracked_states[num_tracked].store(STATE_UNKNOWN, std::memory_order_relaxed);
++	g_libovr_num_tracked_resources.store(num_tracked + 1, std::memory_order_release);
++}
++static bool get_tracked_state(ID3D12Resource *resource, D3D12_RESOURCE_STATES &state)
++{
++	const uint32_t num_tracked = g_libovr_num_tracked_resources.load(std::memory_order_acquire);
++	for (uint32_t k = 0; k < num_tracked; ++k)
++	{
++		if (s_tracked_resources[k].load(std::memory_order_relaxed) == resource)
++		{
++			const uint32_t value = s_tracked_states[k].load(std::memory_order_relaxed);
++			if (value == STATE_UNKNOWN)
++				return false;
++			state = static_cast<D3D12_RESOURCE_STATES>(value);
++			return true;
++		}
++	}
++	return false;
++}
++static void clear_tracked_resources()
++{
++	g_libovr_num_tracked_resources.store(0, std::memory_order_release);
++}
++
++static HMODULE get_runtime_module()
++{
++	return GetModuleHandleW(L"LibOVRRTImpl64_1.dll");
++}
++template <typename T>
++static T get_runtime_proc(const char *name)
++{
++	const HMODULE module = get_runtime_module();
++	return module != nullptr ? reinterpret_cast<T>(GetProcAddress(module, name)) : nullptr;
++}
++
++static void load_config()
++{
++	if (s_config_loaded)
++		return;
++	s_config_loaded = true;
++
++	reshade::global_config().get("LIBOVR", "Disable", s_disabled);
++
++	// Optional override for the eye texture state (D3D12_RESOURCE_STATES value) used when no barrier was observed
++	unsigned int fallback_state = 0;
++	if (reshade::global_config().get("LIBOVR", "FallbackEyeTextureState", fallback_state) && fallback_state != 0)
++		s_fallback_eye_state = reshade::d3d12::convert_resource_states_to_usage(static_cast<D3D12_RESOURCE_STATES>(fallback_state));
++
++	reshade::log::message(reshade::log::level::info, "LibOVR effect support is %s.", s_disabled ? "disabled" : "enabled");
++}
++
++extern "C" ovrResult ovr_CommitTextureSwapChain(ovrSession session, ovrTextureSwapChain chain);
++
++static ovrResult commit_pending(ovrSession session)
++{
++	ovrResult result = 0;
++	for (const ovrTextureSwapChain chain : s_pending_commits)
++		if (const ovrResult chain_result = reshade::hooks::call(ovr_CommitTextureSwapChain)(session, chain); chain_result < 0)
++			result = chain_result;
++	s_pending_commits.clear();
++	return result;
++}
++
++static bool get_current_buffer(ovrSession session, ovrTextureSwapChain chain, com_ptr<ID3D12Resource> &resource)
++{
++	static const auto get_current_index = get_runtime_proc<ovrResult(*)(ovrSession, ovrTextureSwapChain, int *)>("ovr_GetTextureSwapChainCurrentIndex");
++	static const auto get_buffer_dx = get_runtime_proc<ovrResult(*)(ovrSession, ovrTextureSwapChain, int, IID, void **)>("ovr_GetTextureSwapChainBufferDX");
++	if (get_current_index == nullptr || get_buffer_dx == nullptr)
++		return false;
++
++	int index = 0;
++	if (get_current_index(session, chain, &index) < 0)
++		return false;
++	return get_buffer_dx(session, chain, index, IID_PPV_ARGS(&resource)) >= 0 && resource != nullptr;
++}
++
++// Reload the preset when its file changed on disk (e.g. when it is edited through the desktop overlay using the same preset file), since the VR effect runtime has no overlay of its own
++static void check_for_preset_change()
++{
++	static unsigned int s_frame_count = 0;
++	if (++s_frame_count % 30 != 0)
++		return;
++
++	reshade::runtime *const runtime = static_cast<reshade::api::swapchain *>(s_vr_swapchain)->template get_private_data<reshade::runtime>();
++	if (runtime == nullptr || runtime->is_loading())
++		return;
++
++	char preset_path[1024] = "";
++	size_t preset_path_size = sizeof(preset_path);
++	runtime->get_current_preset_path(preset_path, &preset_path_size);
++	if (preset_path[0] == '\0')
++		return;
++
++	std::error_code ec;
++	const std::filesystem::file_time_type modified_at = std::filesystem::last_write_time(std::filesystem::u8path(preset_path), ec);
++	if (ec)
++		return;
++
++	static std::filesystem::path s_last_path;
++	static std::filesystem::file_time_type s_last_modified_at;
++	if (s_last_path != std::filesystem::u8path(preset_path))
++	{
++		s_last_path = std::filesystem::u8path(preset_path);
++		s_last_modified_at = modified_at;
++		return;
++	}
++
++	if (modified_at != s_last_modified_at)
++	{
++		s_last_modified_at = modified_at;
++		reshade::log::message(reshade::log::level::info, "Preset '%s' changed on disk, reloading it in VR ...", preset_path);
++		runtime->set_current_preset_path(preset_path);
++	}
++}
++
++static void apply_effects(ovrSession session)
++{
++	const auto it = s_swapchains.find(s_eye_layer.chain[0]);
++	if (it == s_swapchains.end() || it->second.queue == nullptr)
++		return;
++	D3D12CommandQueue *const queue = it->second.queue;
++
++	com_ptr<ID3D12Resource> eye_textures[2];
++	for (int eye = 0; eye < 2; ++eye)
++		if (!get_current_buffer(session, s_eye_layer.chain[eye], eye_textures[eye]))
++			return;
++
++	// Determine resource state of the eye textures at this point
++	reshade::api::resource_usage eye_states[2];
++	for (int eye = 0; eye < 2; ++eye)
++	{
++		track_resource(eye_textures[eye].get());
++
++		if (D3D12_RESOURCE_STATES state; get_tracked_state(eye_textures[eye].get(), state))
++			eye_states[eye] = reshade::d3d12::convert_resource_states_to_usage(state);
++		else
++			eye_states[eye] = s_fallback_eye_state;
++	}
++
++	if (s_vr_swapchain == nullptr)
++	{
++		reshade::log::message(reshade::log::level::info, "Creating LibOVR effect runtime on command queue %p ...", queue);
++		s_vr_swapchain = new reshade::openvr::swapchain_impl(queue, nullptr);
++	}
++	else if (s_vr_swapchain->get_command_queue() != static_cast<reshade::api::command_queue *>(queue))
++	{
++		return;
++	}
++
++	// Synchronize access to the command queue while events are invoked and the immediate command list may be accessed
++	const std::unique_lock<std::recursive_mutex> lock(queue->_mutex);
++
++	check_for_preset_change();
++
++	for (int eye = 0; eye < 2; ++eye)
++	{
++		const D3D12_RESOURCE_DESC desc = eye_textures[eye]->GetDesc();
++		const ovrRecti &vp = s_eye_layer.viewport[eye];
++
++		vr::VRTextureBounds_t bounds;
++		bounds.uMin = static_cast<float>(vp.x) / static_cast<float>(desc.Width);
++		bounds.vMin = static_cast<float>(vp.y) / static_cast<float>(desc.Height);
++		bounds.uMax = static_cast<float>(vp.x + vp.w) / static_cast<float>(desc.Width);
++		bounds.vMax = static_cast<float>(vp.y + vp.h) / static_cast<float>(desc.Height);
++
++		const uint32_t layer = desc.DepthOrArraySize > 1 ? eye : 0;
++
++		s_vr_swapchain->set_eye_texture_state(eye_states[eye]);
++		// Effects are rendered to the side-by-side texture after the right eye was submitted
++		if (!s_vr_swapchain->on_vr_submit(static_cast<vr::EVREye>(eye), { reinterpret_cast<uintptr_t>(eye_textures[eye].get()) }, vr::ColorSpace_Auto, &bounds, layer))
++			return;
++	}
++
++	// Copy the result back into the application's eye textures
++	reshade::api::command_list *const cmd_list = queue->get_immediate_command_list();
++	const reshade::api::resource side_by_side_texture = s_vr_swapchain->get_back_buffer();
++
++	cmd_list->barrier(side_by_side_texture, reshade::api::resource_usage::general, reshade::api::resource_usage::copy_source);
++
++	for (int eye = 0; eye < 2; ++eye)
++	{
++		const reshade::api::resource eye_texture = { reinterpret_cast<uintptr_t>(eye_textures[eye].get()) };
++		const D3D12_RESOURCE_DESC desc = eye_textures[eye]->GetDesc();
++		const ovrRecti &vp = s_eye_layer.viewport[eye];
++
++		reshade::api::subresource_box source_box = s_vr_swapchain->get_eye_subresource_box(static_cast<vr::EVREye>(eye));
++		const uint32_t width = std::min(source_box.width(), static_cast<uint32_t>(vp.w));
++		const uint32_t height = std::min(source_box.height(), static_cast<uint32_t>(vp.h));
++		source_box.right = source_box.left + width;
++		source_box.bottom = source_box.top + height;
++
++		const reshade::api::subresource_box dest_box = {
++			static_cast<uint32_t>(vp.x), static_cast<uint32_t>(vp.y), 0,
++			static_cast<uint32_t>(vp.x) + width, static_cast<uint32_t>(vp.y) + height, 1 };
++
++		const uint32_t subresource = desc.DepthOrArraySize > 1 ? eye * desc.MipLevels : 0;
++
++		cmd_list->barrier(eye_texture, eye_states[eye], reshade::api::resource_usage::copy_dest);
++		cmd_list->copy_texture_region(side_by_side_texture, 0, &source_box, eye_texture, subresource, &dest_box, reshade::api::filter_mode::min_mag_mip_point);
++		cmd_list->barrier(eye_texture, reshade::api::resource_usage::copy_dest, eye_states[eye]);
++	}
++
++	cmd_list->barrier(side_by_side_texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::general);
++
++	queue->flush_immediate_command_list();
++}
++
++static void update_eye_layer(ovrSession session, const ovrLayerHeader *const *layers, unsigned int layer_count)
++{
++	eye_layer new_layer;
++
++	for (unsigned int i = 0; i < layer_count && !new_layer.valid; ++i)
++	{
++		const ovrLayerHeader *const layer = layers[i];
++		if (layer == nullptr)
++			continue;
++		if (layer->Type != ovrLayerType_EyeFov && layer->Type != ovrLayerType_EyeFovDepth && layer->Type != ovrLayerType_EyeMatrix && layer->Type != ovrLayerType_EyeFovMultires)
++			continue;
++
++		// Header size differs between SDK versions (8 bytes, or 136 bytes with the reserved block), so detect it by looking for a known swap chain handle
++		for (const size_t header_size : { size_t(8), size_t(136) })
++		{
++			const auto data = reinterpret_cast<const uint8_t *>(layer) + header_size;
++			const auto chains = reinterpret_cast<const ovrTextureSwapChain *>(data);
++			if (s_swapchains.find(chains[0]) == s_swapchains.end())
++				continue;
++
++			new_layer.valid = true;
++			new_layer.chain[0] = chains[0];
++			new_layer.chain[1] = chains[1] != nullptr ? chains[1] : chains[0];
++			std::memcpy(new_layer.viewport, data + 2 * sizeof(ovrTextureSwapChain), sizeof(new_layer.viewport));
++
++			if (!s_eye_layer.valid ||
++				std::memcmp(new_layer.chain, s_eye_layer.chain, sizeof(new_layer.chain)) != 0 ||
++				std::memcmp(new_layer.viewport, s_eye_layer.viewport, sizeof(new_layer.viewport)) != 0)
++			{
++				for (int eye = 0; eye < 2; ++eye)
++				{
++					const ovrTextureSwapChainDesc &desc = s_swapchains[new_layer.chain[eye]].desc;
++					reshade::log::message(reshade::log::level::info,
++						"LibOVR eye layer (type %d, header %zu bytes) eye %d: swap chain %p (format %d, %dx%d, array size %d, %d samples), viewport %d,%d %dx%d.",
++						layer->Type, header_size, eye, new_layer.chain[eye], desc.Format, desc.Width, desc.Height, desc.ArraySize, desc.SampleCount,
++						new_layer.viewport[eye].x, new_layer.viewport[eye].y, new_layer.viewport[eye].w, new_layer.viewport[eye].h);
++				}
++			}
++			break;
++		}
++	}
++
++	// Skip multisampled eye textures (only whole subresources can be resolved)
++	if (new_layer.valid)
++		for (int eye = 0; eye < 2; ++eye)
++			if (s_swapchains[new_layer.chain[eye]].desc.SampleCount > 1)
++				new_layer.valid = false;
++
++	if (!new_layer.valid && s_eye_layer.valid)
++		reshade::log::message(reshade::log::level::warning, "LibOVR eye layer no longer found in submitted layers.");
++
++	s_eye_layer = new_layer;
++	(void)session;
++}
++
++static void log_layers(const char *func, const ovrLayerHeader *const *layers, unsigned int layer_count)
++{
++	static unsigned int s_num_logged = 0;
++	if (s_num_logged >= 8)
++		return;
++	s_num_logged++;
++
++	reshade::log::message(reshade::log::level::info, "%s called with %u layer(s) (%zu known swap chains).", func, layer_count, s_swapchains.size());
++	for (unsigned int i = 0; layers != nullptr && i < layer_count; ++i)
++	{
++		const ovrLayerHeader *const layer = layers[i];
++		if (layer == nullptr)
++		{
++			reshade::log::message(reshade::log::level::info, "  layer %u: null", i);
++			continue;
++		}
++		const auto data = reinterpret_cast<const void *const *>(layer);
++		reshade::log::message(reshade::log::level::info, "  layer %u: type %d flags %#x | +8 %p +16 %p | +136 %p +144 %p",
++			i, layer->Type, layer->Flags, data[1], data[2], data[17], data[18]);
++	}
++}
++
++static void on_end_frame(const char *func, ovrSession session, const ovrLayerHeader *const *layers, unsigned int layer_count)
++{
++	const std::unique_lock<std::recursive_mutex> lock(s_mutex);
++
++	log_layers(func, layers, layer_count);
++
++	// Any commits that are still deferred (e.g. because only one of two eye swap chains was committed) have to go through now, without effects
++	if (!s_pending_commits.empty())
++		commit_pending(session);
++
++	if (layers != nullptr)
++		update_eye_layer(session, layers, layer_count);
++}
++
++extern "C" ovrResult ovr_CreateTextureSwapChainDX(ovrSession session, IUnknown *d3dPtr, const ovrTextureSwapChainDesc *desc, ovrTextureSwapChain *out_TextureSwapChain)
++{
++	const ovrResult result = reshade::hooks::call(ovr_CreateTextureSwapChainDX)(session, d3dPtr, desc, out_TextureSwapChain);
++	if (result < 0 || desc == nullptr || out_TextureSwapChain == nullptr || *out_TextureSwapChain == nullptr)
++		return result;
++
++	const std::unique_lock<std::recursive_mutex> lock(s_mutex);
++
++	load_config();
++
++	swapchain_info &info = s_swapchains[*out_TextureSwapChain];
++	info.desc = *desc;
++
++	if (com_ptr<D3D12CommandQueue> command_queue_proxy;
++		d3dPtr != nullptr && SUCCEEDED(d3dPtr->QueryInterface(IID_PPV_ARGS(&command_queue_proxy))))
++		info.queue = command_queue_proxy.get(); // Queue is kept alive by the application for the lifetime of the swap chain
++
++	reshade::log::message(reshade::log::level::info, "Redirecting ovr_CreateTextureSwapChainDX(format = %d, %dx%d, array size = %d, samples = %d, bind flags = %#x) -> %p (D3D12 queue %p).",
++		desc->Format, desc->Width, desc->Height, desc->ArraySize, desc->SampleCount, desc->BindFlags, *out_TextureSwapChain, info.queue);
++
++	return result;
++}
++
++extern "C" void ovr_DestroyTextureSwapChain(ovrSession session, ovrTextureSwapChain chain)
++{
++	{
++		const std::unique_lock<std::recursive_mutex> lock(s_mutex);
++
++		s_swapchains.erase(chain);
++		s_pending_commits.erase(std::remove(s_pending_commits.begin(), s_pending_commits.end(), chain), s_pending_commits.end());
++		if (s_eye_layer.chain[0] == chain || s_eye_layer.chain[1] == chain)
++		{
++			s_eye_layer = {};
++			clear_tracked_resources();
++		}
++	}
++
++	reshade::hooks::call(ovr_DestroyTextureSwapChain)(session, chain);
++}
++
++extern "C" ovrResult ovr_CommitTextureSwapChain(ovrSession session, ovrTextureSwapChain chain)
++{
++	const std::unique_lock<std::recursive_mutex> lock(s_mutex);
++
++	if (static unsigned int s_num_logged = 0; s_num_logged < 8)
++	{
++		s_num_logged++;
++		reshade::log::message(reshade::log::level::info, "ovr_CommitTextureSwapChain(%p) called (known = %d, eye layer valid = %d).",
++			chain, s_swapchains.find(chain) != s_swapchains.end() ? 1 : 0, s_eye_layer.valid ? 1 : 0);
++	}
++
++	if (s_disabled || !s_eye_layer.valid || (chain != s_eye_layer.chain[0] && chain != s_eye_layer.chain[1]))
++		return reshade::hooks::call(ovr_CommitTextureSwapChain)(session, chain);
++
++	// Defer the commit until all eye swap chains were committed, so that effects can be applied to both eyes at once before any of them is handed to the compositor
++	if (std::find(s_pending_commits.begin(), s_pending_commits.end(), chain) == s_pending_commits.end())
++		s_pending_commits.push_back(chain);
++
++	const auto is_pending = [](ovrTextureSwapChain c) { return std::find(s_pending_commits.begin(), s_pending_commits.end(), c) != s_pending_commits.end(); };
++	if (!is_pending(s_eye_layer.chain[0]) || !is_pending(s_eye_layer.chain[1]))
++		return 0; // ovrSuccess
++
++	apply_effects(session);
++
++	return commit_pending(session);
++}
++
++extern "C" ovrResult ovr_EndFrame(ovrSession session, long long frameIndex, const void *viewScaleDesc, const ovrLayerHeader *const *layerPtrList, unsigned int layerCount)
++{
++	on_end_frame("ovr_EndFrame", session, layerPtrList, layerCount);
++
++	return reshade::hooks::call(ovr_EndFrame)(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
++}
++extern "C" ovrResult ovr_SubmitFrame2(ovrSession session, long long frameIndex, const void *viewScaleDesc, const ovrLayerHeader *const *layerPtrList, unsigned int layerCount)
++{
++	on_end_frame("ovr_SubmitFrame2", session, layerPtrList, layerCount);
++
++	return reshade::hooks::call(ovr_SubmitFrame2)(session, frameIndex, viewScaleDesc, layerPtrList, layerCount);
++}
++
++extern "C" void ovr_Destroy(ovrSession session)
++{
++	{
++		const std::unique_lock<std::recursive_mutex> lock(s_mutex);
++
++		reshade::log::message(reshade::log::level::info, "Redirecting ovr_Destroy() ...");
++
++		delete s_vr_swapchain;
++		s_vr_swapchain = nullptr;
++
++		s_swapchains.clear();
++		s_pending_commits.clear();
++		s_eye_layer = {};
++		clear_tracked_resources();
++	}
++
++	reshade::hooks::call(ovr_Destroy)(session);
++}
+diff --git a/source/openvr/openvr_impl_swapchain.cpp b/source/openvr/openvr_impl_swapchain.cpp
+index e568f30..3487d62 100644
+--- a/source/openvr/openvr_impl_swapchain.cpp
++++ b/source/openvr/openvr_impl_swapchain.cpp
+@@ -231,26 +231,26 @@ bool reshade::openvr::swapchain_impl::on_vr_submit(vr::EVREye eye, api::resource
+ 		// In all but D3D12 the eye texture resource is already in copy source state at this point
+ 		// See https://github.com/ValveSoftware/openvr/wiki/Vulkan#image-layout
+ 		if (is_d3d12)
+-			cmd_list->barrier(eye_texture, api::resource_usage::shader_resource_pixel, api::resource_usage::copy_source);
++			cmd_list->barrier(eye_texture, _eye_texture_state, api::resource_usage::copy_source);
+ 		cmd_list->barrier(_side_by_side_texture, api::resource_usage::general, api::resource_usage::copy_dest);
+ 
+ 		cmd_list->copy_texture_region(eye_texture, layer, &source_box, _side_by_side_texture, 0, &dest_box, api::filter_mode::min_mag_mip_point);
+ 
+ 		cmd_list->barrier(_side_by_side_texture, api::resource_usage::copy_dest, api::resource_usage::general);
+ 		if (is_d3d12)
+-			cmd_list->barrier(eye_texture, api::resource_usage::copy_source, api::resource_usage::shader_resource_pixel);
++			cmd_list->barrier(eye_texture, api::resource_usage::copy_source, _eye_texture_state);
+ 	}
+ 	else
+ 	{
+ 		if (is_d3d12)
+-			cmd_list->barrier(eye_texture, api::resource_usage::shader_resource_pixel, api::resource_usage::resolve_source);
++			cmd_list->barrier(eye_texture, _eye_texture_state, api::resource_usage::resolve_source);
+ 		cmd_list->barrier(_side_by_side_texture, api::resource_usage::general, api::resource_usage::resolve_dest);
+ 
+ 		cmd_list->resolve_texture_region(eye_texture, layer, &source_box, _side_by_side_texture, 0, dest_box.left, dest_box.top, dest_box.front, source_desc.texture.format);
+ 
+ 		cmd_list->barrier(_side_by_side_texture, api::resource_usage::resolve_dest, api::resource_usage::general);
+ 		if (is_d3d12)
+-			cmd_list->barrier(eye_texture, api::resource_usage::resolve_source, api::resource_usage::shader_resource_pixel);
++			cmd_list->barrier(eye_texture, api::resource_usage::resolve_source, _eye_texture_state);
+ 	}
+ 
+ #if RESHADE_ADDON
+diff --git a/source/openvr/openvr_impl_swapchain.hpp b/source/openvr/openvr_impl_swapchain.hpp
+index d36b4e5..e9b13a9 100644
+--- a/source/openvr/openvr_impl_swapchain.hpp
++++ b/source/openvr/openvr_impl_swapchain.hpp
+@@ -44,6 +44,8 @@ namespace reshade::openvr
+ 		void on_init();
+ 		void on_reset();
+ 
++		void set_eye_texture_state(api::resource_usage state) { _eye_texture_state = state; }
++
+ 		bool on_vr_submit(vr::EVREye eye, api::resource eye_texture, vr::EColorSpace color_space, const vr::VRTextureBounds_t *bounds, uint32_t layer);
+ 
+ 	private:
+@@ -52,5 +54,6 @@ namespace reshade::openvr
+ 		api::resource _side_by_side_texture = {};
+ 		void *_direct3d_device = nullptr;
+ 		api::color_space _back_buffer_color_space = api::color_space::unknown;
++		api::resource_usage _eye_texture_state = api::resource_usage::shader_resource_pixel;
+ 	};
+ }
